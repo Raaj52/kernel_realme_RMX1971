@@ -795,7 +795,11 @@ static void ufshcd_print_clk_freqs(struct ufs_hba *hba)
 static void ufshcd_print_uic_err_hist(struct ufs_hba *hba,
 		struct ufs_uic_err_reg_hist *err_hist, char *err_name)
 {
+
 	int i;
+	int rc = 0;
+	bool flush_result;
+	unsigned long flags;
 
 	if (!(hba->ufshcd_dbg_print & UFSHCD_DBG_PRINT_UIC_ERR_HIST_EN))
 		return;
@@ -811,6 +815,76 @@ static void ufshcd_print_uic_err_hist(struct ufs_hba *hba,
 }
 
 static inline void __ufshcd_print_host_regs(struct ufs_hba *hba, bool no_sleep)
+
+start:
+	switch (hba->clk_gating.state) {
+	case CLKS_ON:
+		/*
+		 * Wait for the ungate work to complete if in progress.
+		 * Though the clocks may be in ON state, the link could
+		 * still be in hibner8 state if hibern8 is allowed
+		 * during clock gating.
+		 * Make sure we exit hibern8 state also in addition to
+		 * clocks being ON.
+		 */
+		if (ufshcd_can_hibern8_during_gating(hba) &&
+		    ufshcd_is_link_hibern8(hba)) {
+			if (async) {
+				rc = -EAGAIN;
+				hba->clk_gating.active_reqs--;
+				break;
+			}
+			spin_unlock_irqrestore(hba->host->host_lock, flags);
+			flush_result = flush_work(&hba->clk_gating.ungate_work);
+			if (hba->clk_gating.is_suspended && !flush_result)
+				goto out;
+			spin_lock_irqsave(hba->host->host_lock, flags);
+			goto start;
+		}
+		break;
+	case REQ_CLKS_OFF:
+		if (cancel_delayed_work(&hba->clk_gating.gate_work)) {
+			hba->clk_gating.state = CLKS_ON;
+			break;
+		}
+		/*
+		 * If we here, it means gating work is either done or
+		 * currently running. Hence, fall through to cancel gating
+		 * work and to enable clocks.
+		 */
+	case CLKS_OFF:
+		scsi_block_requests(hba->host);
+		hba->clk_gating.state = REQ_CLKS_ON;
+		schedule_work(&hba->clk_gating.ungate_work);
+		/*
+		 * fall through to check if we should wait for this
+		 * work to be done or not.
+		 */
+	case REQ_CLKS_ON:
+		if (async) {
+			rc = -EAGAIN;
+			hba->clk_gating.active_reqs--;
+			break;
+		}
+
+		spin_unlock_irqrestore(hba->host->host_lock, flags);
+		flush_work(&hba->clk_gating.ungate_work);
+		/* Make sure state is CLKS_ON before returning */
+		spin_lock_irqsave(hba->host->host_lock, flags);
+		goto start;
+	default:
+		dev_err(hba->dev, "%s: clk gating is in invalid state %d\n",
+				__func__, hba->clk_gating.state);
+		break;
+	}
+	spin_unlock_irqrestore(hba->host->host_lock, flags);
+out:
+	return rc;
+}
+EXPORT_SYMBOL_GPL(ufshcd_hold);
+
+static void ufshcd_gate_work(struct work_struct *work)
+
 {
 	if (!(hba->ufshcd_dbg_print & UFSHCD_DBG_PRINT_HOST_REGS_EN))
 		return;
@@ -7719,6 +7793,10 @@ static int ufshcd_tune_pa_tactivate(struct ufs_hba *hba)
 {
 	int ret = 0;
 	u32 peer_rx_min_activatetime = 0, tuned_pa_tactivate;
+	u32 intr_status, enabled_intr_status = 0;
+	irqreturn_t retval = IRQ_NONE;
+	struct ufs_hba *hba = __hba;
+	int retries = hba->nutrs;
 
 	if (!ufshcd_is_unipro_pa_params_tuning_req(hba))
 		return 0;
@@ -7737,6 +7815,25 @@ static int ufshcd_tune_pa_tactivate(struct ufs_hba *hba)
 		 / PA_TACTIVATE_TIME_UNIT_US);
 	ret = ufshcd_dme_set(hba, UIC_ARG_MIB(PA_TACTIVATE),
 			     tuned_pa_tactivate);
+				 
+	/*
+	 * There could be max of hba->nutrs reqs in flight and in worst case
+	 * if the reqs get finished 1 by 1 after the interrupt status is
+	 * read, make sure we handle them by checking the interrupt status
+	 * again in a loop until we process all of the reqs before returning.
+	 */
+	while (intr_status && retries--) {
+		enabled_intr_status =
+			intr_status & ufshcd_readl(hba, REG_INTERRUPT_ENABLE);
+		if (intr_status)
+			ufshcd_writel(hba, intr_status, REG_INTERRUPT_STATUS);
+		if (enabled_intr_status) {
+			ufshcd_sl_intr(hba, enabled_intr_status);
+			retval = IRQ_HANDLED;
+		}
+
+		intr_status = ufshcd_readl(hba, REG_INTERRUPT_STATUS);
+	}
 
 out:
 	return ret;
